@@ -28,6 +28,10 @@ const FORMAT_HANDLERS = {
   }
 };
 
+// Stored content from batch extractions, chunked for retrieval
+let _storedContent = null;
+const CHUNK_SIZE = 1024 * 1024; // 1MB chunks for message passing
+
 async function extractConversation(format, options = {}) {
   const logs = [];
   const log = message => {
@@ -45,9 +49,18 @@ async function extractConversation(format, options = {}) {
     if (messages.length > 0) {
       const content = formatConversation(platform, messages, format);
 
-      // If returnContent is set, return the content string instead of triggering download
+      // Batch mode: store content locally, return metadata only
+      // Background will fetch via getChunk messages
       if (options.returnContent) {
-        return { platform, messageCount: messages.length, content, logs };
+        _storedContent = content;
+        const totalChunks = Math.ceil(content.length / CHUNK_SIZE);
+        return {
+          platform,
+          messageCount: messages.length,
+          totalChunks,
+          totalSize: content.length,
+          logs
+        };
       }
 
       const downloadStatus = downloadConversation(content, format);
@@ -60,11 +73,55 @@ async function extractConversation(format, options = {}) {
   }
 }
 
-async function getChatList() {
-  // Scrape sidebar links from the #history div
-  const links = Array.from(document.querySelectorAll('#history a[href^="/c/"]'));
+function getContentChunk(index) {
+  if (!_storedContent) return { error: 'No stored content' };
+  const start = index * CHUNK_SIZE;
+  if (start >= _storedContent.length) return { error: 'Chunk index out of range' };
+  const chunk = _storedContent.substring(start, start + CHUNK_SIZE);
+  const isLast = (start + CHUNK_SIZE) >= _storedContent.length;
+  // Free memory on last chunk
+  if (isLast) _storedContent = null;
+  return { chunk, isLast };
+}
 
-  // Deduplicate by href
+async function getChatList() {
+  const historyDiv = document.querySelector('#history');
+  if (!historyDiv) return { chats: [], error: 'Sidebar #history not found' };
+
+  // Find the scrollable container (the parent that actually scrolls)
+  let scrollContainer = historyDiv;
+  let el = historyDiv;
+  while (el) {
+    if (el.scrollHeight > el.clientHeight + 10) {
+      scrollContainer = el;
+      break;
+    }
+    el = el.parentElement;
+  }
+
+  // Scroll to bottom repeatedly until no new links appear
+  let prevCount = 0;
+  let stableRounds = 0;
+  const maxScrollAttempts = 50;
+
+  for (let i = 0; i < maxScrollAttempts; i++) {
+    const currentCount = historyDiv.querySelectorAll('a[href^="/c/"]').length;
+    if (currentCount === prevCount) {
+      stableRounds++;
+      if (stableRounds >= 3) break; // no new items after 3 tries
+    } else {
+      stableRounds = 0;
+      prevCount = currentCount;
+    }
+    scrollContainer.scrollTop = scrollContainer.scrollHeight;
+    await new Promise(r => setTimeout(r, 500));
+  }
+
+  // Scroll back to top
+  scrollContainer.scrollTop = 0;
+
+  // Collect all links
+  const links = Array.from(historyDiv.querySelectorAll('a[href^="/c/"]'));
   const seen = new Set();
   const chats = [];
   for (const a of links) {
@@ -180,7 +237,7 @@ function extractPoeConversation(format) {
           if (text.length > 1) messages.push(["User", text]);
         }
       }
-      
+
       const aiMessages = Array.from(container.querySelectorAll('div.ChatMessage_messageWrapper__4Ugd6'))
         .filter(msg => !msg.classList.contains('ChatMessage_rightSideMessageWrapper__r0roB'));
       aiMessages.forEach(aiMessage => {
@@ -255,6 +312,8 @@ browserAPI.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "extract") {
     extractConversation(request.format, { returnContent: request.returnContent }).then(sendResponse);
     return true; // keep message channel open for async response
+  } else if (request.action === "getChunk") {
+    sendResponse(getContentChunk(request.index));
   } else if (request.action === "detectPlatform") {
     sendResponse({ platform: detectPlatform() });
   } else if (request.action === "getChatList") {

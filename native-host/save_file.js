@@ -78,6 +78,14 @@ async function handleMessage(msg) {
       return writeFile(msg.dirName, msg.fileName, msg.content);
     }
 
+    // Check if a file already exists (for skip logic)
+    if (msg.action === 'checkExists') {
+      const dirPath = path.join(BASE_DIR, msg.dirName);
+      const filePath = path.join(dirPath, msg.fileName);
+      const exists = fs.existsSync(filePath);
+      return { success: true, exists, path: filePath };
+    }
+
     return { success: false, error: 'Unknown action: ' + msg.action };
   } catch (e) {
     return { success: false, error: e.message };

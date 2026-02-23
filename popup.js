@@ -179,11 +179,14 @@ document.getElementById('batchDownloadBtn').addEventListener('click', () => {
       return;
     }
     if (response && response.results) {
-      const succeeded = response.results.filter(r => r.success).length;
+      const saved = response.results.filter(r => r.success && !r.skipped).length;
+      const skipped = response.results.filter(r => r.skipped).length;
       const failed = response.results.filter(r => !r.success).length;
-      log(`Batch complete: ${succeeded} saved, ${failed} failed.`);
+      log(`Batch complete: ${saved} saved, ${skipped} skipped, ${failed} failed.`);
       response.results.forEach(r => {
-        if (r.success) {
+        if (r.skipped) {
+          log(`  SKIP: ${r.title} (already exists)`);
+        } else if (r.success) {
           log(`  OK: ${r.title} (${r.messageCount} msgs) -> ${r.path}`);
         } else {
           log(`  FAIL: ${r.title} - ${r.error}`);
@@ -198,7 +201,7 @@ browserAPI.runtime.onMessage.addListener((msg) => {
   if (msg.action === 'batchProgress') {
     const pct = Math.round((msg.current / msg.total) * 100);
     document.getElementById('progressFill').style.width = pct + '%';
-    const statusIcon = msg.status === 'done' ? 'OK' : msg.status === 'error' ? 'ERR' : '...';
+    const statusIcon = msg.status === 'done' ? 'OK' : msg.status === 'skipped' ? 'SKIP' : msg.status === 'error' ? 'ERR' : '...';
     document.getElementById('progressText').textContent =
       `${msg.current} / ${msg.total} - [${statusIcon}] ${msg.title}`;
   }

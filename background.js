@@ -2,6 +2,7 @@ const browserAPI = typeof chrome !== 'undefined' ? chrome : browser;
 
 const SUPPORTED_URLS = ['chatgpt.com', 'claude.ai', 'poe.com'];
 const NATIVE_HOST_NAME = 'com.aichatdl.native_host';
+const WINDOW_SIZE = 4; // Process 4 chats per window, then reload tab to free memory
 
 // Listen for tab updates
 browserAPI.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
@@ -48,89 +49,130 @@ function sendToNativeHost(message) {
   });
 }
 
-async function batchExtract(tabId, chats, format) {
-  const results = [];
+// Fetch extracted content from content script in 1MB chunks
+async function fetchContentChunked(tabId, totalChunks) {
+  const parts = [];
+  for (let i = 0; i < totalChunks; i++) {
+    const result = await new Promise((resolve, reject) => {
+      browserAPI.tabs.sendMessage(tabId, { action: 'getChunk', index: i }, resp => {
+        if (browserAPI.runtime.lastError) {
+          reject(new Error(browserAPI.runtime.lastError.message));
+        } else {
+          resolve(resp);
+        }
+      });
+    });
+    if (result.error) throw new Error(result.error);
+    parts.push(result.chunk);
+  }
+  return parts.join('');
+}
+
+function reportProgress(current, total, title, status, error) {
+  browserAPI.runtime.sendMessage({
+    action: 'batchProgress',
+    current, total, title, status,
+    ...(error ? { error } : {})
+  }).catch(() => {}); // popup may be closed
+}
+
+async function extractSingleChat(tabId, chat, format, index, total) {
+  const dirName = sanitizeFilename(chat.title);
   const fileExt = { markdown: 'md', html: 'html', plaintext: 'txt' }[format] || 'md';
+  const fileName = `${dirName}.${fileExt}`;
 
-  for (let i = 0; i < chats.length; i++) {
-    const chat = chats[i];
-    const dirName = sanitizeFilename(chat.title);
-    const fileName = `${dirName}.${fileExt}`;
+  // Check if already saved — skip if so
+  try {
+    const existsResult = await sendToNativeHost({
+      action: 'checkExists',
+      dirName,
+      fileName
+    });
+    if (existsResult && existsResult.exists) {
+      reportProgress(index + 1, total, chat.title, 'skipped');
+      return { title: chat.title, success: true, skipped: true, path: existsResult.path };
+    }
+  } catch (e) {
+    // If checkExists fails, proceed with extraction
+  }
 
-    // Report progress
-    browserAPI.runtime.sendMessage({
-      action: 'batchProgress',
-      current: i + 1,
-      total: chats.length,
-      title: chat.title,
-      status: 'navigating'
-    }).catch(() => {}); // popup may be closed
+  reportProgress(index + 1, total, chat.title, 'navigating');
 
-    try {
-      // Navigate the tab to this conversation
-      await browserAPI.tabs.update(tabId, { url: chat.url });
-      await waitForTabLoad(tabId);
+  try {
+    // Navigate to conversation
+    await browserAPI.tabs.update(tabId, { url: chat.url });
+    await waitForTabLoad(tabId);
 
-      // Extract conversation content (returnContent: true)
-      const response = await new Promise((resolve, reject) => {
-        browserAPI.tabs.sendMessage(tabId, {
-          action: 'extract',
-          format,
-          returnContent: true
-        }, resp => {
-          if (browserAPI.runtime.lastError) {
-            reject(new Error(browserAPI.runtime.lastError.message));
-          } else {
-            resolve(resp);
-          }
-        });
+    // Extract — content script stores content locally, returns metadata
+    const response = await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Extraction timed out')), 60000);
+      browserAPI.tabs.sendMessage(tabId, {
+        action: 'extract',
+        format,
+        returnContent: true
+      }, resp => {
+        clearTimeout(timeout);
+        if (browserAPI.runtime.lastError) {
+          reject(new Error(browserAPI.runtime.lastError.message));
+        } else {
+          resolve(resp);
+        }
+      });
+    });
+
+    if (response && response.totalChunks) {
+      reportProgress(index + 1, total, chat.title, 'saving');
+
+      // Fetch content in chunks to avoid 64MiB message limit
+      const content = await fetchContentChunked(tabId, response.totalChunks);
+
+      // Write to disk via native host
+      const writeResult = await sendToNativeHost({
+        action: 'write',
+        dirName,
+        fileName,
+        content
       });
 
-      if (response && response.content) {
-        // Send to native host to write to disk
-        const writeResult = await sendToNativeHost({
-          action: 'write',
-          dirName,
-          fileName,
-          content: response.content
-        });
-
-        results.push({
-          title: chat.title,
-          success: writeResult.success,
-          path: writeResult.path,
-          messageCount: response.messageCount
-        });
-
-        browserAPI.runtime.sendMessage({
-          action: 'batchProgress',
-          current: i + 1,
-          total: chats.length,
-          title: chat.title,
-          status: 'done'
-        }).catch(() => {});
-      } else {
-        const errorMsg = response?.error || 'No content extracted';
-        results.push({ title: chat.title, success: false, error: errorMsg });
-        browserAPI.runtime.sendMessage({
-          action: 'batchProgress',
-          current: i + 1,
-          total: chats.length,
-          title: chat.title,
-          status: 'error',
-          error: errorMsg
-        }).catch(() => {});
-      }
-    } catch (err) {
-      results.push({ title: chat.title, success: false, error: err.message });
-      browserAPI.runtime.sendMessage({
-        action: 'batchProgress',
-        current: i + 1,
-        total: chats.length,
+      reportProgress(index + 1, total, chat.title, 'done');
+      return {
         title: chat.title,
-        status: 'error',
-        error: err.message
-      }).catch(() => {});
+        success: writeResult.success,
+        path: writeResult.path,
+        messageCount: response.messageCount
+      };
+    } else {
+      const errorMsg = response?.error || 'No content extracted';
+      reportProgress(index + 1, total, chat.title, 'error', errorMsg);
+      return { title: chat.title, success: false, error: errorMsg };
+    }
+  } catch (err) {
+    reportProgress(index + 1, total, chat.title, 'error', err.message);
+    return { title: chat.title, success: false, error: err.message };
+  }
+}
+
+async function batchExtract(tabId, chats, format) {
+  const results = [];
+
+  for (let windowStart = 0; windowStart < chats.length; windowStart += WINDOW_SIZE) {
+    const windowEnd = Math.min(windowStart + WINDOW_SIZE, chats.length);
+
+    // Process this window of chats
+    for (let i = windowStart; i < windowEnd; i++) {
+      const result = await extractSingleChat(tabId, chats[i], format, i, chats.length);
+      results.push(result);
+    }
+
+    // After each window, reload the tab to a blank chatgpt page to free memory
+    // (skip if this was the last window)
+    if (windowEnd < chats.length) {
+      try {
+        await browserAPI.tabs.update(tabId, { url: 'https://chatgpt.com/' });
+        await waitForTabLoad(tabId);
+      } catch (e) {
+        // If reload fails, continue anyway
+      }
     }
   }
 
