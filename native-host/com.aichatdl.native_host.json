@@ -1,0 +1,9 @@
+{
+  "name": "com.aichatdl.native_host",
+  "description": "AI Chat Downloader - Native file writer for batch downloads",
+  "path": "/Users/nathan.baker/Downloads/aichatdl-v1.3.3/native-host/save_file.js",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://dcgkiodphadapmkidoilpgmgohpikpck/"
+  ]
+}

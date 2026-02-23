@@ -71,3 +71,135 @@ document.getElementById('copyDebugBtn').addEventListener('click', () => {
     .then(() => log('Debug log copied to clipboard.'))
     .catch(err => log('Failed to copy debug log: ' + err));
 });
+
+// --- Batch Download ---
+
+let chatListData = [];
+
+const getCurrentSiteHostname = () => {
+  return new Promise(resolve => {
+    browserAPI.tabs.query({active: true, currentWindow: true}, tabs => {
+      if (tabs[0]) {
+        try { resolve(new URL(tabs[0].url).hostname); } catch { resolve(''); }
+      } else {
+        resolve('');
+      }
+    });
+  });
+};
+
+// Show batch section only on chatgpt.com
+getCurrentSiteHostname().then(hostname => {
+  if (hostname === 'chatgpt.com') {
+    document.getElementById('batchSection').style.display = 'block';
+  }
+});
+
+document.getElementById('loadChatsBtn').addEventListener('click', () => {
+  log('Loading chat list...');
+  document.getElementById('loadChatsBtn').textContent = 'Loading...';
+  document.getElementById('loadChatsBtn').disabled = true;
+
+  browserAPI.tabs.query({active: true, currentWindow: true}, tabs => {
+    browserAPI.tabs.sendMessage(tabs[0].id, {action: 'getChatList'}, response => {
+      document.getElementById('loadChatsBtn').textContent = 'Load Chat List';
+      document.getElementById('loadChatsBtn').disabled = false;
+
+      if (browserAPI.runtime.lastError) {
+        log('Error loading chats: ' + browserAPI.runtime.lastError.message);
+        return;
+      }
+
+      if (response && response.chats && response.chats.length > 0) {
+        chatListData = response.chats;
+        renderChatList(chatListData);
+        document.getElementById('chatListContainer').style.display = 'block';
+        log(`Loaded ${chatListData.length} chats.`);
+      } else {
+        log('No chats found. Make sure the ChatGPT sidebar is visible.');
+      }
+    });
+  });
+});
+
+function renderChatList(chats) {
+  const container = document.getElementById('chatList');
+  container.innerHTML = '';
+  chats.forEach((chat, i) => {
+    const div = document.createElement('div');
+    div.className = 'chat-item';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.id = `chat-${i}`;
+    cb.value = i;
+    const lbl = document.createElement('label');
+    lbl.htmlFor = `chat-${i}`;
+    lbl.textContent = chat.title;
+    lbl.title = chat.title;
+    div.appendChild(cb);
+    div.appendChild(lbl);
+    container.appendChild(div);
+  });
+}
+
+document.getElementById('selectAllBtn').addEventListener('click', () => {
+  const checkboxes = document.querySelectorAll('#chatList input[type="checkbox"]');
+  const allChecked = Array.from(checkboxes).every(cb => cb.checked);
+  checkboxes.forEach(cb => cb.checked = !allChecked);
+  document.getElementById('selectAllBtn').textContent = allChecked ? 'Select All' : 'Deselect All';
+});
+
+document.getElementById('batchDownloadBtn').addEventListener('click', () => {
+  const selected = Array.from(document.querySelectorAll('#chatList input[type="checkbox"]:checked'))
+    .map(cb => chatListData[parseInt(cb.value)]);
+
+  if (selected.length === 0) {
+    log('No chats selected for batch download.');
+    return;
+  }
+
+  const format = document.querySelector('input[name="format"]:checked').value;
+  log(`Starting batch download of ${selected.length} chats in ${format} format...`);
+
+  // Show progress
+  const progressDiv = document.getElementById('batchProgress');
+  progressDiv.style.display = 'block';
+  document.getElementById('progressFill').style.width = '0%';
+  document.getElementById('progressText').textContent = `0 / ${selected.length}`;
+  document.getElementById('batchDownloadBtn').disabled = true;
+
+  browserAPI.runtime.sendMessage({
+    action: 'batchExtract',
+    chats: selected,
+    format
+  }, response => {
+    document.getElementById('batchDownloadBtn').disabled = false;
+    if (browserAPI.runtime.lastError) {
+      log('Batch error: ' + browserAPI.runtime.lastError.message);
+      return;
+    }
+    if (response && response.results) {
+      const succeeded = response.results.filter(r => r.success).length;
+      const failed = response.results.filter(r => !r.success).length;
+      log(`Batch complete: ${succeeded} saved, ${failed} failed.`);
+      response.results.forEach(r => {
+        if (r.success) {
+          log(`  OK: ${r.title} (${r.messageCount} msgs) -> ${r.path}`);
+        } else {
+          log(`  FAIL: ${r.title} - ${r.error}`);
+        }
+      });
+    }
+  });
+});
+
+// Listen for progress updates from background
+browserAPI.runtime.onMessage.addListener((msg) => {
+  if (msg.action === 'batchProgress') {
+    const pct = Math.round((msg.current / msg.total) * 100);
+    document.getElementById('progressFill').style.width = pct + '%';
+    const statusIcon = msg.status === 'done' ? 'OK' : msg.status === 'error' ? 'ERR' : '...';
+    document.getElementById('progressText').textContent =
+      `${msg.current} / ${msg.total} - [${statusIcon}] ${msg.title}`;
+  }
+});

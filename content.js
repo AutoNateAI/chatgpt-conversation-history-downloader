@@ -28,7 +28,7 @@ const FORMAT_HANDLERS = {
   }
 };
 
-async function extractConversation(format) {
+async function extractConversation(format, options = {}) {
   const logs = [];
   const log = message => {
     console.log(message);
@@ -44,6 +44,12 @@ async function extractConversation(format) {
 
     if (messages.length > 0) {
       const content = formatConversation(platform, messages, format);
+
+      // If returnContent is set, return the content string instead of triggering download
+      if (options.returnContent) {
+        return { platform, messageCount: messages.length, content, logs };
+      }
+
       const downloadStatus = downloadConversation(content, format);
       return { platform, messageCount: messages.length, downloadInitiated: true, logs };
     } else {
@@ -52,6 +58,25 @@ async function extractConversation(format) {
   } catch (error) {
     return { error: `Extraction failed: ${error.message}`, logs };
   }
+}
+
+async function getChatList() {
+  // Scrape sidebar links from the #history div
+  const links = Array.from(document.querySelectorAll('#history a[href^="/c/"]'));
+
+  // Deduplicate by href
+  const seen = new Set();
+  const chats = [];
+  for (const a of links) {
+    const href = a.getAttribute('href');
+    if (seen.has(href)) continue;
+    seen.add(href);
+    const id = href.replace('/c/', '');
+    const title = a.textContent.trim() || 'Untitled';
+    chats.push({ id, title, url: `https://chatgpt.com${href}` });
+  }
+
+  return { chats };
 }
 
 function detectPlatform() {
@@ -228,9 +253,12 @@ function simplifyHtml(html) {
 
 browserAPI.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "extract") {
-    extractConversation(request.format).then(sendResponse);
+    extractConversation(request.format, { returnContent: request.returnContent }).then(sendResponse);
     return true; // keep message channel open for async response
   } else if (request.action === "detectPlatform") {
     sendResponse({ platform: detectPlatform() });
+  } else if (request.action === "getChatList") {
+    getChatList().then(sendResponse);
+    return true;
   }
 });
