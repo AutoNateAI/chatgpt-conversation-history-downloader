@@ -28,10 +28,6 @@ const FORMAT_HANDLERS = {
   }
 };
 
-// Stored content from batch extractions, chunked for retrieval
-let _storedContent = null;
-const CHUNK_SIZE = 1024 * 1024; // 1MB chunks for message passing
-
 async function extractConversation(format, options = {}) {
   const logs = [];
   const log = message => {
@@ -49,18 +45,10 @@ async function extractConversation(format, options = {}) {
     if (messages.length > 0) {
       const content = formatConversation(platform, messages, format);
 
-      // Batch mode: store content locally, return metadata only
-      // Background will fetch via getChunk messages
-      if (options.returnContent) {
-        _storedContent = content;
-        const totalChunks = Math.ceil(content.length / CHUNK_SIZE);
-        return {
-          platform,
-          messageCount: messages.length,
-          totalChunks,
-          totalSize: content.length,
-          logs
-        };
+      // Batch mode: download with custom filename
+      if (options.batchDownload && options.fileName) {
+        downloadConversationAs(content, options.fileName);
+        return { platform, messageCount: messages.length, downloadInitiated: true, logs };
       }
 
       const downloadStatus = downloadConversation(content, format);
@@ -71,17 +59,6 @@ async function extractConversation(format, options = {}) {
   } catch (error) {
     return { error: `Extraction failed: ${error.message}`, logs };
   }
-}
-
-function getContentChunk(index) {
-  if (!_storedContent) return { error: 'No stored content' };
-  const start = index * CHUNK_SIZE;
-  if (start >= _storedContent.length) return { error: 'Chunk index out of range' };
-  const chunk = _storedContent.substring(start, start + CHUNK_SIZE);
-  const isLast = (start + CHUNK_SIZE) >= _storedContent.length;
-  // Free memory on last chunk
-  if (isLast) _storedContent = null;
-  return { chunk, isLast };
 }
 
 async function getChatList() {
@@ -108,7 +85,7 @@ async function getChatList() {
     const currentCount = historyDiv.querySelectorAll('a[href^="/c/"]').length;
     if (currentCount === prevCount) {
       stableRounds++;
-      if (stableRounds >= 3) break; // no new items after 3 tries
+      if (stableRounds >= 3) break;
     } else {
       stableRounds = 0;
       prevCount = currentCount;
@@ -117,10 +94,8 @@ async function getChatList() {
     await new Promise(r => setTimeout(r, 500));
   }
 
-  // Scroll back to top
   scrollContainer.scrollTop = 0;
 
-  // Collect all links
   const links = Array.from(historyDiv.querySelectorAll('a[href^="/c/"]'));
   const seen = new Set();
   const chats = [];
@@ -164,7 +139,7 @@ async function imgToBase64(src) {
       reader.readAsDataURL(blob);
     });
   } catch (e) {
-    return src; // fallback to original URL if fetch fails
+    return src;
   }
 }
 
@@ -173,16 +148,13 @@ async function extractChatGPTConversation(format) {
   const results = [];
 
   for (const article of articles) {
-    // Determine speaker from data-message-author-role within the article
     const roleEl = article.querySelector('[data-message-author-role]');
     const role = roleEl ? roleEl.getAttribute('data-message-author-role') : null;
     const speaker = role === 'user' ? "User" : "AI";
 
-    // Get text content from markdown or whitespace-pre-wrap divs
     const contentDiv = article.querySelector('.markdown, .whitespace-pre-wrap');
     let text = contentDiv ? extractContent(contentDiv, format) : '';
 
-    // Collect unique images from the entire article, deduplicating by URL path
     const seenPaths = new Set();
     const imgElements = Array.from(article.querySelectorAll('img'))
       .filter(img => {
@@ -197,7 +169,6 @@ async function extractChatGPTConversation(format) {
         }
       });
 
-    // Convert images to base64 and append
     for (const img of imgElements) {
       const dataUri = await imgToBase64(img.src);
       if (format === 'markdown') {
@@ -275,6 +246,16 @@ function downloadConversation(content, format) {
   return 'File download initiated';
 }
 
+function downloadConversationAs(content, fileName) {
+  const blob = new Blob([content], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fileName;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 function htmlToMarkdown(html) {
   return html
     .replace(/<img\b[^>]*src="([^"]*)"[^>]*alt="([^"]*)"[^>]*\/?>/gi, '![$2]($1)')
@@ -310,10 +291,11 @@ function simplifyHtml(html) {
 
 browserAPI.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === "extract") {
-    extractConversation(request.format, { returnContent: request.returnContent }).then(sendResponse);
-    return true; // keep message channel open for async response
-  } else if (request.action === "getChunk") {
-    sendResponse(getContentChunk(request.index));
+    extractConversation(request.format, {
+      batchDownload: request.batchDownload,
+      fileName: request.fileName
+    }).then(sendResponse);
+    return true;
   } else if (request.action === "detectPlatform") {
     sendResponse({ platform: detectPlatform() });
   } else if (request.action === "getChatList") {
